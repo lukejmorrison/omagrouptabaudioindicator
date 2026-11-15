@@ -11,6 +11,9 @@ Item {
 
   property var marks: []
   property string parsed: ""
+  property int waveIndex: 0
+  // 0 cone, 1 one wave, 2 both waves, then back to one wave.
+  readonly property int wavePhase: waveIndex === 2 ? 2 : (waveIndex === 0 ? 0 : 1)
   property color activeInk: "#070B09"
   // Qt reads an 8-digit hex as AARRGGBB. #ffffff88 is opaque yellow, not dim white.
   property color inactiveInk: Qt.rgba(1, 1, 1, 136 / 255)
@@ -59,9 +62,25 @@ Item {
       var payload = JSON.parse(raw || "{}")
       root.marks = Array.isArray(payload.windows) ? payload.windows : []
       root.parsed = raw
+      root.syncWaveTimer()
     } catch (error) {
       // A torn read keeps the last good set. The next reload replaces it.
     }
+  }
+
+  function syncWaveTimer() {
+    waveTimer.running = !!(root.marks && root.marks.length > 0)
+  }
+
+  // One phase for every pill, so two playing speakers pulse together.
+  // Started from applyMarks. A binding on marks.length does not see a
+  // replaced array, so the clock would never start.
+  Timer {
+    id: waveTimer
+    interval: 180
+    repeat: true
+    running: false
+    onTriggered: root.waveIndex = (root.waveIndex + 1) % 4
   }
 
   function forScreen(screen) {
@@ -85,6 +104,7 @@ Item {
     onLoadFailed: {
       root.parsed = ""
       root.marks = []
+      root.syncWaveTimer()
     }
   }
 
@@ -130,6 +150,22 @@ Item {
       }
       mask: Region {}
 
+      // This layer commits a buffer when a frame is scheduled. One frame per
+      // phase step is enough to show the new wave.
+      FrameAnimation {
+        id: present
+        running: false
+        onTriggered: running = false
+      }
+
+      Connections {
+        target: root
+        function onWaveIndexChanged() {
+          if (panel.visible)
+            present.running = true
+        }
+      }
+
       Repeater {
         model: panel.mine
 
@@ -142,8 +178,11 @@ Item {
           x: Math.round(modelData.x + modelData.width - (modelData.iconEdge || 6) - width)
           y: Math.round(modelData.y + (modelData.height - height) / 2)
 
+          // A single canvas repaint does not commit a new frame on this
+          // layer. Each wave is its own item so a phase step changes opacity,
+          // which does.
           Canvas {
-            id: glyph
+            id: body
             anchors.fill: parent
             property color ink: speaker.ink
             onInkChanged: requestPaint()
@@ -152,10 +191,7 @@ Item {
             onPaint: {
               var ctx = getContext("2d")
               ctx.clearRect(0, 0, width, height)
-              ctx.fillStyle = glyph.ink
-              ctx.strokeStyle = glyph.ink
-              ctx.lineCap = "round"
-              ctx.lineWidth = Math.max(1, width / 14 * 1.25)
+              ctx.fillStyle = body.ink
               var s = width / 14
               ctx.fillRect(1 * s, 5 * s, 3 * s, 4 * s)
               ctx.beginPath()
@@ -164,9 +200,45 @@ Item {
               ctx.lineTo(8 * s, 12 * s)
               ctx.closePath()
               ctx.fill()
+            }
+          }
+
+          Canvas {
+            id: innerWave
+            anchors.fill: parent
+            property color ink: speaker.ink
+            opacity: root.wavePhase >= 1 ? 1 : 0
+            onInkChanged: requestPaint()
+            onWidthChanged: requestPaint()
+            Component.onCompleted: requestPaint()
+            onPaint: {
+              var ctx = getContext("2d")
+              ctx.clearRect(0, 0, width, height)
+              ctx.strokeStyle = innerWave.ink
+              ctx.lineCap = "round"
+              ctx.lineWidth = Math.max(1, width / 14 * 1.25)
+              var s = width / 14
               ctx.beginPath()
               ctx.arc(8.2 * s, 7 * s, 2.6 * s, -0.9, 0.9, false)
               ctx.stroke()
+            }
+          }
+
+          Canvas {
+            id: outerWave
+            anchors.fill: parent
+            property color ink: speaker.ink
+            opacity: root.wavePhase >= 2 ? 1 : 0
+            onInkChanged: requestPaint()
+            onWidthChanged: requestPaint()
+            Component.onCompleted: requestPaint()
+            onPaint: {
+              var ctx = getContext("2d")
+              ctx.clearRect(0, 0, width, height)
+              ctx.strokeStyle = outerWave.ink
+              ctx.lineCap = "round"
+              ctx.lineWidth = Math.max(1, width / 14 * 1.25)
+              var s = width / 14
               ctx.beginPath()
               ctx.arc(8.2 * s, 7 * s, 4.6 * s, -0.8, 0.8, false)
               ctx.stroke()
