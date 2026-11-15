@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "wizwam.group-audio",
+  "name": "Group tab speaker",
+  "version": "1.0.0",
+  "author": "Luke Morrison",
+  "license": "MIT",
+  "description": "Draws a speaker on the Hyprland group pill of the window that is playing audio.",
+  "kinds": ["service"],
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}
