@@ -9,6 +9,7 @@ the JSON this writes; it does not decide who is audible.
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import re
@@ -17,7 +18,9 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
+from enum import Enum
 from pathlib import Path
 
 LEADING_COUNT = re.compile(r"^\(\d+\)\s*")
@@ -51,9 +54,12 @@ DEFAULT_OPTS = {
 }
 COALESCE_SEC = 0.08
 PEAK_FLOOR = 32
-PEAK_CACHE_SEC = 0.75
 PEAK_HOLD_SEC = 1.5
-PEAK_FRAMES = 2048
+PEAK_RATE = 48000
+PEAK_CHANNELS = 2
+PEAK_SAMPLE_BYTES = 2
+PEAK_WINDOW_FRAMES = 2048
+METER_FIRST_SEC = 1.0
 TIP_LIMIT = 96
 
 
@@ -480,66 +486,283 @@ def peak_has_signal(raw: bytes) -> bool:
     return False
 
 
-def probe_peak(serial: int) -> bool:
-    try:
-        completed = subprocess.run(
-            [
-                "pw-cat",
-                "-r",
-                "-a",
-                "--target",
-                str(serial),
-                "--format",
-                "s16",
-                "--channels",
-                "2",
-                "--rate",
-                "48000",
-                "-n",
-                str(PEAK_FRAMES),
-                "-",
-            ],
-            check=False,
-            capture_output=True,
-            timeout=1,
+def _frame_bytes() -> int:
+    return PEAK_CHANNELS * PEAK_SAMPLE_BYTES
+
+
+def _window_bytes() -> int:
+    return PEAK_WINDOW_FRAMES * _frame_bytes()
+
+
+class _Heard(Enum):
+    LOUD = "loud"
+    QUIET = "quiet"
+    FAILED = "failed"
+
+
+class _Meter:
+    def __init__(self, serial: int, proc: subprocess.Popen[bytes]) -> None:
+        self.serial = serial
+        self.proc = proc
+        self.loud_until = 0.0
+        self._view: tuple[bytes | None, bool] = (None, False)
+        self._ready = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def view(self) -> tuple[bytes | None, bool]:
+        return self._view
+
+    def wait_ready(self, timeout: float) -> None:
+        self._ready.wait(timeout)
+
+    def start_reader(self) -> None:
+        self._thread = threading.Thread(
+            target=self._read_forever,
+            name=f"pw-cat-{self.serial}",
+            daemon=True,
         )
-    except (subprocess.SubprocessError, OSError):
-        return True
-    if len(completed.stdout) < 2:
-        return True
-    return peak_has_signal(completed.stdout)
+        self._thread.start()
+
+    def close(self) -> None:
+        proc = self.proc
+        self.proc = None
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+                proc.wait(timeout=1)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        self._mark_dead()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=0.2)
+        _unlink_pid(self.serial)
+
+    def _publish(self, pcm: bytes) -> None:
+        self._view = (pcm, False)
+        if peak_has_signal(pcm):
+            self.loud_until = time.monotonic() + PEAK_HOLD_SEC
+        self._ready.set()
+
+    def _mark_dead(self) -> None:
+        pcm, _dead = self._view
+        self._view = (pcm, True)
+        self._ready.set()
+
+    def _read_forever(self) -> None:
+        buf = bytearray()
+        window = _window_bytes()
+        frame = _frame_bytes()
+        proc = self.proc
+        stream = proc.stdout if proc is not None else None
+        try:
+            if stream is None:
+                return
+            while True:
+                try:
+                    chunk = stream.read(window)
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                buf.extend(chunk)
+                if len(buf) > window:
+                    extra = len(buf) - window
+                    drop = extra - (extra % frame)
+                    if drop:
+                        del buf[:drop]
+                aligned = len(buf) - (len(buf) % frame)
+                if aligned >= frame:
+                    self._publish(bytes(buf[:aligned]))
+        finally:
+            self._mark_dead()
+
+
+def _pw_cat_argv(serial: int) -> list[str]:
+    return [
+        "pw-cat",
+        "-r",
+        "-a",
+        "--target",
+        str(serial),
+        "--format",
+        "s16",
+        "--channels",
+        str(PEAK_CHANNELS),
+        "--rate",
+        str(PEAK_RATE),
+        "-",
+    ]
+
+
+def _capture_meter(serial: int) -> _Meter:
+    proc = subprocess.Popen(
+        _pw_cat_argv(serial),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        bufsize=0,
+    )
+    try:
+        _write_pid(serial, proc.pid)
+        meter = _Meter(serial, proc)
+        meter.start_reader()
+        return meter
+    except Exception:
+        try:
+            proc.kill()
+            proc.wait(timeout=1)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        _unlink_pid(serial)
+        raise
+
+
+def _meter_dir() -> Path:
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    return Path(runtime) / "groupbar-audio" / "meters"
+
+
+def _write_pid(serial: int, pid: int) -> None:
+    directory = _meter_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / str(serial)
+    tmp = directory / f".{serial}.tmp"
+    tmp.write_text(f"{pid}\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _unlink_pid(serial: int) -> None:
+    (_meter_dir() / str(serial)).unlink(missing_ok=True)
+
+
+def _cmdline(pid: int) -> list[str] | None:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    return [part.decode("utf-8", "surrogateescape") for part in raw.split(b"\0") if part]
+
+
+def _is_meter_pid(pid: int, serial: int) -> bool:
+    args = _cmdline(pid)
+    if not args or pid <= 0:
+        return False
+    if Path(args[0]).name != "pw-cat":
+        return False
+    target = str(serial)
+    for index, arg in enumerate(args[:-1]):
+        if arg == "--target" and args[index + 1] == target:
+            return True
+    return False
+
+
+def _reap_orphans() -> None:
+    directory = _meter_dir()
+    if not directory.is_dir():
+        return
+    for path in list(directory.iterdir()):
+        if not path.name.isdigit():
+            continue
+        serial = int(path.name)
+        try:
+            pid = int(path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            path.unlink(missing_ok=True)
+            continue
+        if _is_meter_pid(pid, serial):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        path.unlink(missing_ok=True)
 
 
 class PeakCache:
-    def __init__(self, probe=None, now=None, ttl: float = PEAK_CACHE_SEC, hold: float = PEAK_HOLD_SEC) -> None:
-        self.probe = probe or probe_peak
+    def __init__(self, source=None, now=None, hold: float = PEAK_HOLD_SEC) -> None:
+        self.source = _capture_meter if source is None else source
         self.now = now or time.monotonic
-        self.ttl = ttl
         self.hold = hold
-        # saved: probed_at, shown, heard_until. A 40ms speech window can sit under the floor.
-        self.saved: dict[int, tuple[float, bool, float]] = {}
+        self.meters: dict[int, _Meter] = {}
+        self.saved: dict[int, tuple[bool, float]] = {}
+        if source is None:
+            _reap_orphans()
+            atexit.register(self.close_all)
+
+    def reconcile(self, wanted: set[int]) -> None:
+        wanted = set(wanted)
+        for serial in list(self.meters):
+            gone = serial not in wanted
+            _pcm, dead = self.meters[serial].view()
+            if gone or dead:
+                self.meters[serial].close()
+                del self.meters[serial]
+                if gone:
+                    self.saved.pop(serial, None)
+        for serial in wanted:
+            if serial not in self.meters:
+                self._start(serial)
 
     def has_signal(self, serial: int) -> bool:
         now = self.now()
         saved = self.saved.get(serial)
-        if saved is not None and now - saved[0] < self.ttl:
-            return saved[1]
-        fresh = bool(self.probe(serial))
-        heard = saved[2] if saved is not None else 0.0
+        verdict = self._listen(serial)
+        if verdict is _Heard.QUIET:
+            fresh = False
+        elif verdict is _Heard.LOUD or verdict is _Heard.FAILED:
+            fresh = True
+        else:
+            raise AssertionError(verdict)
+        heard_until = saved[1] if saved is not None else 0.0
+        meter = self.meters.get(serial)
+        if meter is not None:
+            heard_until = max(heard_until, meter.loud_until)
         if fresh:
-            heard = now + self.hold
-        shown = fresh or now < heard
-        self.saved[serial] = (now, shown, heard)
+            heard_until = max(heard_until, now + self.hold)
+        shown = fresh or now < heard_until
+        self.saved[serial] = (shown, heard_until)
         return shown
+
+    def _listen(self, serial: int) -> _Heard:
+        meter = self.meters.get(serial)
+        if meter is None:
+            return _Heard.FAILED
+        pcm, dead = meter.view()
+        if not dead and (pcm is None or len(pcm) < _frame_bytes()):
+            meter.wait_ready(METER_FIRST_SEC)
+            pcm, dead = meter.view()
+        if dead or pcm is None or len(pcm) < _frame_bytes():
+            return _Heard.FAILED
+        if peak_has_signal(pcm):
+            return _Heard.LOUD
+        return _Heard.QUIET
+
+    def _start(self, serial: int) -> None:
+        try:
+            self.meters[serial] = self.source(serial)
+        except Exception as exc:
+            log(f"meter {serial} failed to start: {exc}")
+
+    def close_all(self) -> None:
+        for serial in list(self.meters):
+            self.meters.pop(serial).close()
 
 
 def stamp_signal(nodes: list[dict], peaks: PeakCache) -> None:
+    wanted: set[int] = set()
+    pending: list[tuple[dict, int]] = []
     for node in nodes:
         if node.get("state") != "running" or node.get("mute") or node.get("corked"):
             continue
         serial = node.get("serial")
         if not isinstance(serial, int):
             continue
+        wanted.add(serial)
+        pending.append((node, serial))
+    peaks.reconcile(wanted)
+    for node, serial in pending:
         node["has_signal"] = peaks.has_signal(serial)
 
 
@@ -843,6 +1066,15 @@ class Publisher:
         return True
 
 
+def idle_select_timeout(pending: bool, deadline: float, now: float, hold: float | None) -> float | None:
+    timeout = max(0.0, deadline - now) if pending else None
+    if hold is None:
+        return timeout
+    if timeout is None or timeout > hold:
+        return hold
+    return timeout
+
+
 def serve() -> None:
     publisher = Publisher()
     pending = True
@@ -854,22 +1086,22 @@ def serve() -> None:
             log(f"waiting for session: {exc}")
             time.sleep(1)
             continue
-        timeout = None
-        if pending:
-            timeout = max(0.0, deadline - time.monotonic())
+        now = time.monotonic()
+        hold = publisher.peaks.hold if publisher.peaks.meters else None
+        timeout = idle_select_timeout(pending, deadline, now, hold)
         try:
             ready, _, _ = select.select(publisher.fds(), [], [], timeout)
         except InterruptedError:
             continue
         now = time.monotonic()
-        if pending and not ready and now >= deadline:
-            publisher.publish()
-            pending = False
+        if not ready:
+            if (pending and now >= deadline) or publisher.peaks.meters:
+                publisher.publish()
+                pending = False
             continue
-        if ready:
-            publisher.drain()
-            pending = True
-            deadline = time.monotonic() + COALESCE_SEC
+        publisher.drain()
+        pending = True
+        deadline = time.monotonic() + COALESCE_SEC
 
 
 def main(argv: list[str]) -> int:

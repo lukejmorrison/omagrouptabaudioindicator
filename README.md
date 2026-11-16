@@ -7,7 +7,7 @@ Hyprland's group bar paints the window title and has no icon slot. This plugin i
 - `group_audio.py` watches PipeWire and Hyprland, then writes `~/.local/state/omarchy/group-audio.json`.
 - `Service.qml` draws a click-through speaker on that pill. Clicks still reach the group bar.
 
-A process with one window is marked while its playback stream is running and a short sample of that stream is louder than silence. A browser with several windows is marked when a Playing MPRIS title, or an idle inhibitor, picks the toplevel. Capture, monitor, and loopback nodes are ignored. Muted and corked streams are ignored.
+A process with one window is marked while its playback stream is running and the latest captured samples are louder than silence. The service keeps one pw-cat capture open for each running stream and closes it when the stream stops. A browser with several windows is marked when a Playing MPRIS title, or an idle inhibitor, picks the toplevel. Capture, monitor, and loopback nodes are ignored. Muted and corked streams are ignored.
 
 Plugin id: `wizwam.group-audio`.
 

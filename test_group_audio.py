@@ -3,10 +3,16 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
+import subprocess
 import sys
+import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import group_audio
@@ -528,42 +534,285 @@ class ParseTests(unittest.TestCase):
         self.assertFalse(group_audio.peak_has_signal((32).to_bytes(2, "little", signed=True)))
         self.assertTrue(group_audio.peak_has_signal((33).to_bytes(2, "little", signed=True)))
 
-    def test_peak_cache_reuses_a_serial_inside_the_window(self):
-        calls = []
+    def test_proc_parent_of_this_process(self):
+        parent = group_audio.proc_parent(os.getpid())
+        self.assertIsInstance(parent, int)
+        self.assertGreater(parent, 1)
+
+
+LOUD = (33).to_bytes(2, "little", signed=True) * 64
+QUIET = b"\x00\x00" * 64
+
+
+class ScriptMeter:
+    def __init__(self, pcm: bytes | None = None, dead: bool = False) -> None:
+        self.pcm = pcm
+        self.dead = dead
+        self.closes = 0
+        self.loud_until = 0.0
+
+    def view(self):
+        return self.pcm, self.dead
+
+    def wait_ready(self, timeout: float) -> None:
+        return None
+
+    def close(self) -> None:
+        self.closes += 1
+        self.dead = True
+
+
+class PeakCacheTests(unittest.TestCase):
+    def test_loud_window_shows_on_the_next_read(self):
         clock = {"t": 0.0}
-
-        def probe(serial):
-            calls.append(serial)
-            return False
-
-        cache = group_audio.PeakCache(probe=probe, now=lambda: clock["t"], ttl=0.75)
+        script = ScriptMeter(QUIET)
+        cache = group_audio.PeakCache(source=lambda serial: script, now=lambda: clock["t"], hold=1.5)
+        cache.reconcile({5})
         self.assertFalse(cache.has_signal(5))
-        clock["t"] = 0.4
-        self.assertFalse(cache.has_signal(5))
-        self.assertEqual(calls, [5])
-        clock["t"] = 0.8
-        cache.has_signal(5)
-        self.assertEqual(calls, [5, 5])
-
-    def test_peak_cache_keeps_a_recent_signal_through_a_quiet_probe(self):
-        answers = iter([True, False, False])
-        clock = {"t": 0.0}
-        cache = group_audio.PeakCache(
-            probe=lambda serial: next(answers),
-            now=lambda: clock["t"],
-            ttl=0.75,
-            hold=1.5,
-        )
+        script.pcm = LOUD
+        clock["t"] = 0.1
         self.assertTrue(cache.has_signal(5))
+
+    def test_hold_survives_one_quiet_window(self):
+        clock = {"t": 0.0}
+        script = ScriptMeter(LOUD)
+        cache = group_audio.PeakCache(source=lambda serial: script, now=lambda: clock["t"], hold=1.5)
+        cache.reconcile({5})
+        self.assertTrue(cache.has_signal(5))
+        script.pcm = QUIET
         clock["t"] = 0.8
         self.assertTrue(cache.has_signal(5))
         clock["t"] = 2.4
         self.assertFalse(cache.has_signal(5))
 
-    def test_proc_parent_of_this_process(self):
-        parent = group_audio.proc_parent(os.getpid())
-        self.assertIsInstance(parent, int)
-        self.assertGreater(parent, 1)
+    def test_meter_loud_until_bridges_quiet_between_idle_polls(self):
+        clock = {"t": 10.0}
+        script = ScriptMeter(QUIET)
+        script.loud_until = 11.4
+        cache = group_audio.PeakCache(source=lambda serial: script, now=lambda: clock["t"], hold=1.5)
+        cache.reconcile({5})
+        self.assertTrue(cache.has_signal(5))
+        clock["t"] = 11.5
+        self.assertFalse(cache.has_signal(5))
+
+    def test_reconcile_starts_each_serial_once(self):
+        started = []
+        meters = {}
+
+        def source(serial):
+            started.append(serial)
+            meter = ScriptMeter(QUIET)
+            meters[serial] = meter
+            return meter
+
+        cache = group_audio.PeakCache(source=source, now=lambda: 0.0)
+        cache.reconcile({5, 6})
+        cache.reconcile({5, 6})
+        self.assertEqual(len(started), 2)
+        self.assertCountEqual(started, [5, 6])
+        cache.reconcile({6})
+        self.assertEqual(meters[5].closes, 1)
+        self.assertEqual(meters[6].closes, 0)
+        cache.reconcile({6})
+        self.assertEqual(meters[5].closes, 1)
+        self.assertEqual(len(started), 2)
+
+    def test_restart_keeps_hold(self):
+        clock = {"t": 0.0}
+        samples = iter([LOUD, QUIET])
+
+        def source(serial):
+            return ScriptMeter(next(samples))
+
+        cache = group_audio.PeakCache(source=source, now=lambda: clock["t"], hold=1.5)
+        cache.reconcile({5})
+        self.assertTrue(cache.has_signal(5))
+        cache.meters[5].dead = True
+        clock["t"] = 0.2
+        cache.reconcile({5})
+        clock["t"] = 0.4
+        self.assertTrue(cache.has_signal(5))
+
+    def test_dead_meter_is_fail_open(self):
+        cache = group_audio.PeakCache(source=lambda serial: ScriptMeter(None, dead=True), now=lambda: 0.0)
+        cache.reconcile({5})
+        self.assertTrue(cache.has_signal(5))
+
+    def test_missing_meter_is_fail_open(self):
+        calls = []
+
+        def source(serial):
+            calls.append(serial)
+            return ScriptMeter(LOUD)
+
+        cache = group_audio.PeakCache(source=source, now=lambda: 0.0)
+        self.assertTrue(cache.has_signal(9))
+        self.assertEqual(calls, [])
+
+    def test_empty_after_wait_is_fail_open(self):
+        cache = group_audio.PeakCache(source=lambda serial: ScriptMeter(None, dead=False), now=lambda: 0.0)
+        cache.reconcile({5})
+        self.assertTrue(cache.has_signal(5))
+
+    def test_start_failure_stays_fail_open_and_retries(self):
+        calls = []
+
+        def source(serial):
+            calls.append(serial)
+            raise OSError("pw-cat failed")
+
+        cache = group_audio.PeakCache(source=source, now=lambda: 0.0)
+        with contextlib.redirect_stderr(io.StringIO()):
+            cache.reconcile({5})
+            self.assertTrue(cache.has_signal(5))
+            cache.reconcile({5})
+        self.assertEqual(calls, [5, 5])
+
+    def test_stamp_signal_meters_running_serials_only(self):
+        started = []
+
+        def source(serial):
+            started.append(serial)
+            return ScriptMeter(LOUD)
+
+        cache = group_audio.PeakCache(source=source, now=lambda: 0.0)
+        nodes = [
+            {"state": "running", "serial": 5},
+            {"state": "running", "mute": True, "serial": 6},
+            {"state": "idle", "serial": 7},
+            {"state": "running", "serial": "nope"},
+            {"state": "running", "corked": True, "serial": 8},
+        ]
+        group_audio.stamp_signal(nodes, cache)
+        group_audio.stamp_signal(nodes, cache)
+        self.assertEqual(started, [5])
+        self.assertTrue(nodes[0]["has_signal"])
+        self.assertNotIn("has_signal", nodes[1])
+        self.assertNotIn("has_signal", nodes[2])
+
+    def test_open_meter_caps_idle_select(self):
+        now = 10.0
+        self.assertIsNone(group_audio.idle_select_timeout(False, 0.0, now, None))
+        self.assertEqual(group_audio.idle_select_timeout(True, 10.5, now, None), 0.5)
+        self.assertEqual(group_audio.idle_select_timeout(False, 0.0, now, group_audio.PEAK_HOLD_SEC), group_audio.PEAK_HOLD_SEC)
+        self.assertEqual(group_audio.idle_select_timeout(True, 12.0, now, group_audio.PEAK_HOLD_SEC), group_audio.PEAK_HOLD_SEC)
+        self.assertEqual(group_audio.idle_select_timeout(True, 10.5, now, group_audio.PEAK_HOLD_SEC), 0.5)
+
+    def test_capture_argv_omits_a_sample_count(self):
+        argv = group_audio._pw_cat_argv(12)
+        self.assertNotIn("-n", argv)
+        self.assertEqual(argv[argv.index("--target") + 1], "12")
+        self.assertIn("-r", argv)
+
+
+class MeterProcessTests(unittest.TestCase):
+    def test_reader_keeps_the_latest_window_and_dies_on_eof(self):
+        read_fd, write_fd = os.pipe()
+        frame = group_audio._frame_bytes()
+        window = group_audio._window_bytes()
+        loud = (33).to_bytes(2, "little", signed=True) * (frame // 2)
+        quiet = b"\x00\x00" * (window // 2)
+        proc = _PipeProc(read_fd)
+        meter = group_audio._Meter(4, proc)
+        meter.start_reader()
+        try:
+            os.write(write_fd, loud + quiet)
+            os.close(write_fd)
+            write_fd = -1
+            deadline = time.monotonic() + 2
+            pcm = None
+            dead = False
+            while time.monotonic() < deadline:
+                pcm, dead = meter.view()
+                if dead and pcm is not None:
+                    break
+                time.sleep(0.01)
+            self.assertTrue(dead)
+            self.assertIsNotNone(pcm)
+            self.assertFalse(group_audio.peak_has_signal(pcm))
+            self.assertLessEqual(len(pcm), window)
+            self.assertEqual(len(pcm) % frame, 0)
+        finally:
+            if write_fd >= 0:
+                os.close(write_fd)
+            if meter._thread is not None:
+                meter._thread.join(timeout=1)
+            proc.stdout.close()
+
+    def test_second_close_does_not_kill_again(self):
+        read_fd, write_fd = os.pipe()
+        os.close(write_fd)
+        proc = _PipeProc(read_fd)
+        with tempfile.TemporaryDirectory() as runtime:
+            with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": runtime}):
+                meter = group_audio._Meter(5, proc)
+                meter.start_reader()
+                meter.close()
+                meter.close()
+        self.assertEqual(proc.kills, 1)
+
+    def test_reap_kills_only_a_pw_cat_for_that_serial(self):
+        with tempfile.TemporaryDirectory() as runtime:
+            ours = _spawn_pw_cat(["--target", "5", "--rate", "48000"])
+            rate_lookalike = _spawn_pw_cat(["--target", "9", "--rate", "48000"])
+            try:
+                with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": runtime}):
+                    group_audio._write_pid(5, ours.pid)
+                    group_audio._write_pid(48000, rate_lookalike.pid)
+                    group_audio._reap_orphans()
+                ours.wait(timeout=2)
+                self.assertEqual(ours.returncode, -9)
+                self.assertIsNone(rate_lookalike.poll())
+                meter_dir = Path(runtime) / "groupbar-audio" / "meters"
+                self.assertFalse((meter_dir / "5").exists())
+                self.assertFalse((meter_dir / "48000").exists())
+            finally:
+                for proc in (ours, rate_lookalike):
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.wait(timeout=1)
+
+
+def _spawn_pw_cat(args: list[str]) -> subprocess.Popen:
+    # argv0 has to stay pw-cat. A shebang would show the interpreter instead.
+    proc = subprocess.Popen(
+        ["pw-cat", "-c", "import time; time.sleep(30)", *args],
+        executable=sys.executable,
+    )
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            raw = Path(f"/proc/{proc.pid}/cmdline").read_bytes()
+        except OSError:
+            break
+        parts = [part.decode() for part in raw.split(b"\0") if part]
+        if parts and Path(parts[0]).name == "pw-cat" and "--target" in parts:
+            return proc
+        time.sleep(0.01)
+    proc.kill()
+    raise AssertionError("pw-cat argv never appeared")
+
+
+class _PipeProc:
+    def __init__(self, read_fd: int) -> None:
+        self.stdout = os.fdopen(read_fd, "rb", buffering=0)
+        self.pid = 4242
+        self.returncode = None
+        self.kills = 0
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self) -> None:
+        self.kills += 1
+        self.returncode = -9
+        try:
+            self.stdout.close()
+        except OSError:
+            pass
+
+    def wait(self, timeout=None):
+        return self.returncode
 
 
 if __name__ == "__main__":
