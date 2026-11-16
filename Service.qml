@@ -220,10 +220,15 @@ Item {
           required property var modelData
           readonly property color ink: modelData.focused ? root.activeInk : root.inactiveInk
           readonly property string tip: root.tipOf(modelData)
+          // Whole pill, not the 14px glyph. The empty mask still passes clicks.
           readonly property bool hovered: {
             var localX = root.pointerX - panel.modelData.x
             var localY = root.pointerY - panel.modelData.y
-            return localX >= x && localX < x + width && localY >= y && localY < y + height
+            var pillX = modelData.x
+            var pillY = modelData.y
+            var pillW = modelData.width
+            var pillH = modelData.height
+            return localX >= pillX && localX < pillX + pillW && localY >= pillY && localY < pillY + pillH
           }
           width: 14
           height: 14
@@ -234,9 +239,8 @@ Item {
             visible: speaker.hovered && speaker.tip.length > 0
             color: "#070B09"
             radius: 4
-            anchors.right: parent.left
-            anchors.rightMargin: 6
-            anchors.verticalCenter: parent.verticalCenter
+            x: Math.round(modelData.x - speaker.x)
+            y: Math.round(modelData.y + modelData.height + 4 - speaker.y)
             width: tipLabel.implicitWidth + 12
             height: tipLabel.implicitHeight + 8
 
