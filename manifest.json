@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "wizwam.group-audio",
-  "name": "Group tab speaker",
+  "name": "Group Tab Audio Indicator",
   "version": "1.0.0",
   "author": "Luke Morrison",
   "license": "MIT",
