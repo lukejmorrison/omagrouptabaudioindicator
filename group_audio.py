@@ -50,6 +50,11 @@ DEFAULT_OPTS = {
     "disable_when_only": False,
 }
 COALESCE_SEC = 0.08
+PEAK_FLOOR = 32
+PEAK_CACHE_SEC = 0.75
+PEAK_HOLD_SEC = 1.5
+PEAK_FRAMES = 2048
+TIP_LIMIT = 96
 
 
 def log(message: str) -> None:
@@ -185,6 +190,38 @@ def match_windows(group: list[dict], players: list[dict], parent_of) -> list[dic
     return chosen
 
 
+def audible_node(node: dict) -> bool:
+    if node.get("media_class") != "Stream/Output/Audio" or node.get("state") != "running":
+        return False
+    if node.get("mute") or node.get("corked"):
+        return False
+    if not node.get("has_signal", True):
+        return False
+    pid = node.get("pid")
+    return isinstance(pid, int) and pid > 0
+
+
+def clip_tip(value) -> str:
+    text = str(value or "").strip()
+    if len(text) <= TIP_LIMIT:
+        return text
+    return text[:TIP_LIMIT]
+
+
+def node_tips(node: dict) -> dict:
+    app = clip_tip(node.get("name")) or clip_tip(node.get("binary"))
+    media = clip_tip(node.get("media_name"))
+    sink = clip_tip(node.get("target"))
+    tips = {}
+    if app:
+        tips["tipApp"] = app
+    if media:
+        tips["tipMedia"] = media
+    if sink:
+        tips["tipSink"] = sink
+    return tips
+
+
 def audible_windows(windows: list[dict], nodes: list[dict], players: list[dict], parent_of) -> list[dict]:
     by_pid: dict[int, list[dict]] = {}
     for window in windows:
@@ -192,14 +229,9 @@ def audible_windows(windows: list[dict], nodes: list[dict], players: list[dict],
     owners: list[int] = []
     seen_owners: set[int] = set()
     for node in nodes:
-        if node.get("media_class") != "Stream/Output/Audio":
+        if not audible_node(node):
             continue
-        if node.get("state") != "running":
-            continue
-        pid = node.get("pid")
-        if not isinstance(pid, int) or pid <= 0:
-            continue
-        owner = walk_owner(pid, by_pid, parent_of)
+        owner = walk_owner(node["pid"], by_pid, parent_of)
         if owner is None or owner in seen_owners:
             continue
         seen_owners.add(owner)
@@ -221,16 +253,30 @@ def streams_by_owner(windows: list[dict], nodes: list[dict], parent_of) -> dict[
         by_pid.setdefault(window["pid"], []).append(window)
     counts: dict[int, int] = {}
     for node in nodes:
-        if node.get("media_class") != "Stream/Output/Audio" or node.get("state") != "running":
+        if not audible_node(node):
             continue
-        pid = node.get("pid")
-        if not isinstance(pid, int) or pid <= 0:
-            continue
-        owner = walk_owner(pid, by_pid, parent_of)
+        owner = walk_owner(node["pid"], by_pid, parent_of)
         if owner is None:
             continue
         counts[owner] = counts.get(owner, 0) + 1
     return counts
+
+
+def tips_by_owner(windows: list[dict], nodes: list[dict], parent_of) -> dict:
+    by_pid: dict[int, list[dict]] = {}
+    for window in windows:
+        by_pid.setdefault(window["pid"], []).append(window)
+    found: dict[int, dict] = {}
+    for node in nodes:
+        if not audible_node(node):
+            continue
+        owner = walk_owner(node["pid"], by_pid, parent_of)
+        if owner is None or owner in found:
+            continue
+        tips = node_tips(node)
+        if tips:
+            found[owner] = tips
+    return found
 
 
 def hold_marks(owner: int, fresh: list[dict], stream_count: int, memory: dict, counts: dict) -> list[str]:
@@ -261,6 +307,7 @@ def resolve_audible(windows: list[dict], nodes: list[dict], players: list[dict],
                 bucket.append(addr)
     fresh = audible_windows(windows, nodes, players, parent_of)
     current = streams_by_owner(windows, nodes, parent_of)
+    tips = tips_by_owner(windows, nodes, parent_of)
     by_addr = {window["address"]: window for window in windows}
     owners = set(current) | set(memory)
     marked: list[dict] = []
@@ -274,7 +321,9 @@ def resolve_audible(windows: list[dict], nodes: list[dict], players: list[dict],
                 continue
             seen.add(addr)
             living.append(addr)
-            marked.append(window)
+            stamped = dict(window)
+            stamped.update(tips.get(owner, {}))
+            marked.append(stamped)
         if living:
             memory[owner] = living
         else:
@@ -326,26 +375,64 @@ def placements(marked: list[dict], monitors_by_id: dict, opts: dict) -> list[dic
             continue
         index = grouped.index(window["address"])
         x, y, width, height = pill_geometry(window, index, count, opts)
-        found.append(
-            {
-                "address": window["address"],
-                "monitor": monitor["name"],
-                "monitorX": monitor["x"],
-                "monitorY": monitor["y"],
-                "x": round_px(x - monitor["x"]),
-                "y": round_px(y - monitor["y"]),
-                "width": round_px(width),
-                "height": round_px(height),
-                "textPadding": int(opts["text_padding"]),
-                "iconEdge": ICON_EDGE,
-                "focused": window.get("focus_history") == 0,
-            }
-        )
+        entry = {
+            "address": window["address"],
+            "monitor": monitor["name"],
+            "monitorX": monitor["x"],
+            "monitorY": monitor["y"],
+            "x": round_px(x - monitor["x"]),
+            "y": round_px(y - monitor["y"]),
+            "width": round_px(width),
+            "height": round_px(height),
+            "textPadding": int(opts["text_padding"]),
+            "iconEdge": ICON_EDGE,
+            "focused": window.get("focus_history") == 0,
+        }
+        for key in ("tipApp", "tipMedia", "tipSink"):
+            if window.get(key):
+                entry[key] = window[key]
+        found.append(entry)
     found.sort(key=lambda entry: (entry["monitor"], entry["x"], entry["address"]))
     return found
 
 
+def as_bool(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() == "true"
+    return value is True
+
+
+def as_int(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def sink_by_output(pw_objects: list) -> dict:
+    descriptions = {}
+    for obj in pw_objects:
+        if not isinstance(obj, dict) or obj.get("type") != "PipeWire:Interface:Node":
+            continue
+        description = ((obj.get("info") or {}).get("props") or {}).get("node.description")
+        if description:
+            descriptions[obj.get("id")] = description
+    found = {}
+    for obj in pw_objects:
+        if not isinstance(obj, dict) or obj.get("type") != "PipeWire:Interface:Link":
+            continue
+        props = (obj.get("info") or {}).get("props") or {}
+        output_id = props.get("link.output.node")
+        if output_id in found:
+            continue
+        description = descriptions.get(props.get("link.input.node"))
+        if description:
+            found[output_id] = description
+    return found
+
+
 def playback_nodes(pw_objects: list) -> list[dict]:
+    sinks = sink_by_output(pw_objects)
     nodes = []
     for obj in pw_objects:
         if not isinstance(obj, dict) or obj.get("type") != "PipeWire:Interface:Node":
@@ -356,19 +443,104 @@ def playback_nodes(pw_objects: list) -> list[dict]:
             continue
         if info.get("state") != "running":
             continue
-        pid = props.get("application.process.id")
-        try:
-            pid = int(pid)
-        except (TypeError, ValueError):
+        pid = as_int(props.get("application.process.id"))
+        if pid is None or pid <= 0:
             continue
+        props_list = (info.get("params") or {}).get("Props") or []
+        mute = False
+        if isinstance(props_list, list) and props_list and isinstance(props_list[0], dict):
+            mute = as_bool(props_list[0].get("mute"))
         nodes.append(
             {
                 "pid": pid,
                 "state": info.get("state") or "",
                 "media_class": props.get("media.class") or "",
+                "serial": as_int(props.get("object.serial")),
+                "name": str(props.get("application.name") or ""),
+                "binary": str(props.get("application.process.binary") or ""),
+                "media_name": str(props.get("media.name") or ""),
+                "target": sinks.get(obj.get("id")) or str(props.get("target.object") or ""),
+                "mute": mute,
+                "corked": as_bool(props.get("pulse.corked")),
             }
         )
     return nodes
+
+
+def peak_has_signal(raw: bytes) -> bool:
+    count = len(raw) // 2
+    peak = 0
+    for index in range(count):
+        sample = int.from_bytes(raw[index * 2 : index * 2 + 2], "little", signed=True)
+        magnitude = abs(sample)
+        if magnitude > peak:
+            peak = magnitude
+        if peak > PEAK_FLOOR:
+            return True
+    return False
+
+
+def probe_peak(serial: int) -> bool:
+    try:
+        completed = subprocess.run(
+            [
+                "pw-cat",
+                "-r",
+                "-a",
+                "--target",
+                str(serial),
+                "--format",
+                "s16",
+                "--channels",
+                "2",
+                "--rate",
+                "48000",
+                "-n",
+                str(PEAK_FRAMES),
+                "-",
+            ],
+            check=False,
+            capture_output=True,
+            timeout=1,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return True
+    if len(completed.stdout) < 2:
+        return True
+    return peak_has_signal(completed.stdout)
+
+
+class PeakCache:
+    def __init__(self, probe=None, now=None, ttl: float = PEAK_CACHE_SEC, hold: float = PEAK_HOLD_SEC) -> None:
+        self.probe = probe or probe_peak
+        self.now = now or time.monotonic
+        self.ttl = ttl
+        self.hold = hold
+        # saved: probed_at, shown, heard_until. A 40ms speech window can sit under the floor.
+        self.saved: dict[int, tuple[float, bool, float]] = {}
+
+    def has_signal(self, serial: int) -> bool:
+        now = self.now()
+        saved = self.saved.get(serial)
+        if saved is not None and now - saved[0] < self.ttl:
+            return saved[1]
+        fresh = bool(self.probe(serial))
+        heard = saved[2] if saved is not None else 0.0
+        if fresh:
+            heard = now + self.hold
+        shown = fresh or now < heard
+        self.saved[serial] = (now, shown, heard)
+        return shown
+
+
+def stamp_signal(nodes: list[dict], peaks: PeakCache) -> None:
+    for node in nodes:
+        if node.get("state") != "running" or node.get("mute") or node.get("corked"):
+            continue
+        serial = node.get("serial")
+        if not isinstance(serial, int):
+            continue
+        node["has_signal"] = peaks.has_signal(serial)
 
 
 def client_to_window(client: dict) -> dict | None:
@@ -530,7 +702,7 @@ def fetch_players() -> list[dict]:
     return players
 
 
-def collect_snapshot(options: dict | None, memory: dict | None = None, counts: dict | None = None, prior: list[str] | None = None) -> tuple[dict, dict]:
+def collect_snapshot(options: dict | None, memory: dict | None = None, counts: dict | None = None, prior: list[str] | None = None, peaks: PeakCache | None = None) -> tuple[dict, dict]:
     opts = options if options is not None else fetch_options()
     clients = run_json(["hyprctl", "clients", "-j"], 3)
     monitors = run_json(["hyprctl", "monitors", "-j"], 3)
@@ -541,6 +713,8 @@ def collect_snapshot(options: dict | None, memory: dict | None = None, counts: d
         if window and window["address"] and window["pid"] > 0:
             windows.append(window)
     nodes = playback_nodes(pw)
+    if peaks is not None:
+        stamp_signal(nodes, peaks)
     players = fetch_players() if any(node.get("state") == "running" for node in nodes) else []
     payload = snapshot(windows, nodes, players, monitors_by_id(monitors), opts, proc_parent, memory, counts, prior)
     return payload, opts
@@ -607,6 +781,7 @@ class Publisher:
         self.memory: dict = {}
         self.counts: dict = {}
         self.seeded = False
+        self.peaks = PeakCache()
 
     def ensure(self) -> None:
         if self.sock is None:
@@ -652,7 +827,7 @@ class Publisher:
             if not self.seeded:
                 self.seeded = True
                 prior = held_addresses(state_path())
-            payload, self.options = collect_snapshot(self.options, self.memory, self.counts, prior)
+            payload, self.options = collect_snapshot(self.options, self.memory, self.counts, prior, self.peaks)
         except (subprocess.SubprocessError, json.JSONDecodeError, OSError, ValueError) as exc:
             log(f"collect failed: {exc}")
             self.options_dirty = True

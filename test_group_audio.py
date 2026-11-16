@@ -234,6 +234,42 @@ class MatcherTests(unittest.TestCase):
         marked = group_audio.audible_windows(windows, nodes, [], parents({7: 1}))
         self.assertEqual(marked, [])
 
+    def test_silent_running_stream_does_not_mark_a_single_toplevel(self):
+        windows = [window(address="0xue", pid=7, title="MyProject - Unreal Editor", grouped=["0xue", "0xterm"])]
+        nodes = [
+            {
+                "pid": 7,
+                "state": "running",
+                "media_class": "Stream/Output/Audio",
+                "name": "SDL Application",
+                "binary": "UnrealEditor",
+                "media_name": "Audio Stream",
+                "has_signal": False,
+            }
+        ]
+        marked = group_audio.audible_windows(windows, nodes, [], parents({7: 1}))
+        self.assertEqual(marked, [])
+
+    def test_silent_running_stream_drops_a_held_mark(self):
+        windows = [window(address="0xue", pid=7, title="MyProject - Unreal Editor", grouped=["0xue", "0xterm"])]
+        nodes = [{"pid": 7, "state": "running", "media_class": "Stream/Output/Audio", "has_signal": False}]
+        marked = group_audio.resolve_audible(windows, nodes, [], parents({7: 1}), {7: ["0xue"]}, {7: 1})
+        self.assertEqual(marked, [])
+
+    def test_running_stream_with_signal_marks_a_single_toplevel(self):
+        windows = [window(address="0xmpv", pid=7, title="a film", grouped=["0xmpv", "0xterm"])]
+        nodes = [{"pid": 7, "state": "running", "media_class": "Stream/Output/Audio", "has_signal": True, "name": "mpv"}]
+        marked = group_audio.audible_windows(windows, nodes, [], parents({7: 1}))
+        self.assertEqual([item["address"] for item in marked], ["0xmpv"])
+
+    def test_muted_or_corked_running_stream_does_not_mark(self):
+        windows = [window(address="0xmpv", pid=7, grouped=["0xmpv", "0xterm"])]
+        parent = parents({7: 1})
+        muted = [{"pid": 7, "state": "running", "media_class": "Stream/Output/Audio", "mute": True, "has_signal": True}]
+        corked = [{"pid": 7, "state": "running", "media_class": "Stream/Output/Audio", "corked": True, "has_signal": True}]
+        self.assertEqual(group_audio.audible_windows(windows, muted, [], parent), [])
+        self.assertEqual(group_audio.audible_windows(windows, corked, [], parent), [])
+
     def test_foreign_mpris_does_not_mark_the_browser(self):
         windows = chromium_windows()
         for item in windows:
@@ -335,6 +371,46 @@ class SlotTests(unittest.TestCase):
         )
         self.assertEqual(payload["windows"], [])
 
+    def test_placement_names_the_stream(self):
+        playing = window(address="0xmpv", pid=7, title="a film", grouped=["0xmpv", "0xterm"], monitor_id=2)
+        nodes = [
+            {
+                "pid": 7,
+                "state": "running",
+                "media_class": "Stream/Output/Audio",
+                "has_signal": True,
+                "name": "Chromium",
+                "binary": "chromium",
+                "media_name": "Playback",
+                "target": "Jabra SPEAK 410 Analog Stereo",
+            }
+        ]
+        payload = group_audio.snapshot([playing], nodes, [], dp2(), LIVE_OPTS, parents({7: 1}))
+        self.assertEqual(len(payload["windows"]), 1)
+        slot = payload["windows"][0]
+        self.assertEqual(slot.get("tipApp"), "Chromium")
+        self.assertEqual(slot.get("tipMedia"), "Playback")
+        self.assertEqual(slot.get("tipSink"), "Jabra SPEAK 410 Analog Stereo")
+
+    def test_placement_uses_the_binary_when_the_app_name_is_empty(self):
+        playing = window(address="0xue", pid=7, title="MyProject - Unreal Editor", grouped=["0xue", "0xterm"], monitor_id=2)
+        nodes = [
+            {
+                "pid": 7,
+                "state": "running",
+                "media_class": "Stream/Output/Audio",
+                "has_signal": True,
+                "name": "",
+                "binary": "UnrealEditor",
+                "media_name": "Audio Stream",
+                "target": "Jabra SPEAK 410 Analog Stereo",
+            }
+        ]
+        payload = group_audio.snapshot([playing], nodes, [], dp2(), LIVE_OPTS, parents({7: 1}))
+        slot = payload["windows"][0]
+        self.assertEqual(slot.get("tipApp"), "UnrealEditor")
+        self.assertEqual(slot.get("tipMedia"), "Audio Stream")
+
 
 class ParseTests(unittest.TestCase):
     def test_hyprctl_option_lines(self):
@@ -373,7 +449,116 @@ class ParseTests(unittest.TestCase):
                 },
             ]
         )
-        self.assertEqual(nodes, [{"pid": 100, "state": "running", "media_class": "Stream/Output/Audio"}])
+        self.assertEqual(
+            nodes,
+            [
+                {
+                    "pid": 100,
+                    "state": "running",
+                    "media_class": "Stream/Output/Audio",
+                    "serial": None,
+                    "name": "",
+                    "binary": "",
+                    "media_name": "Playback",
+                    "target": "",
+                    "mute": False,
+                    "corked": False,
+                }
+            ],
+        )
+
+    def test_playback_nodes_carry_stream_identity(self):
+        nodes = group_audio.playback_nodes(
+            [
+                {
+                    "type": "PipeWire:Interface:Node",
+                    "id": 116,
+                    "info": {
+                        "state": "running",
+                        "props": {
+                            "media.class": "Stream/Output/Audio",
+                            "application.process.id": "2464936",
+                            "application.name": "SDL Application",
+                            "application.process.binary": "UnrealEditor",
+                            "media.name": "Audio Stream",
+                            "object.serial": 983469,
+                            "target.object": "alsa_output.usb-jabra",
+                            "pulse.corked": False,
+                        },
+                        "params": {"Props": [{"mute": False}]},
+                    },
+                },
+                {
+                    "type": "PipeWire:Interface:Node",
+                    "id": 33,
+                    "info": {
+                        "state": "running",
+                        "props": {
+                            "media.class": "Audio/Sink",
+                            "node.description": "Jabra SPEAK 410 Analog Stereo",
+                        },
+                    },
+                },
+                {
+                    "type": "PipeWire:Interface:Link",
+                    "info": {"props": {"link.output.node": 116, "link.input.node": 33}},
+                },
+            ]
+        )
+        self.assertEqual(
+            nodes,
+            [
+                {
+                    "pid": 2464936,
+                    "state": "running",
+                    "media_class": "Stream/Output/Audio",
+                    "serial": 983469,
+                    "name": "SDL Application",
+                    "binary": "UnrealEditor",
+                    "media_name": "Audio Stream",
+                    "target": "Jabra SPEAK 410 Analog Stereo",
+                    "mute": False,
+                    "corked": False,
+                }
+            ],
+        )
+
+    def test_peak_above_the_floor_is_signal(self):
+        self.assertFalse(group_audio.peak_has_signal(b"\x00\x00" * 64))
+        self.assertFalse(group_audio.peak_has_signal((32).to_bytes(2, "little", signed=True)))
+        self.assertTrue(group_audio.peak_has_signal((33).to_bytes(2, "little", signed=True)))
+
+    def test_peak_cache_reuses_a_serial_inside_the_window(self):
+        calls = []
+        clock = {"t": 0.0}
+
+        def probe(serial):
+            calls.append(serial)
+            return False
+
+        cache = group_audio.PeakCache(probe=probe, now=lambda: clock["t"], ttl=0.75)
+        self.assertFalse(cache.has_signal(5))
+        clock["t"] = 0.4
+        self.assertFalse(cache.has_signal(5))
+        self.assertEqual(calls, [5])
+        clock["t"] = 0.8
+        cache.has_signal(5)
+        self.assertEqual(calls, [5, 5])
+
+    def test_peak_cache_keeps_a_recent_signal_through_a_quiet_probe(self):
+        answers = iter([True, False, False])
+        clock = {"t": 0.0}
+        cache = group_audio.PeakCache(
+            probe=lambda serial: next(answers),
+            now=lambda: clock["t"],
+            ttl=0.75,
+            hold=1.5,
+        )
+        self.assertTrue(cache.has_signal(5))
+        clock["t"] = 0.8
+        self.assertTrue(cache.has_signal(5))
+        clock["t"] = 2.4
+        self.assertFalse(cache.has_signal(5))
 
     def test_proc_parent_of_this_process(self):
         parent = group_audio.proc_parent(os.getpid())
