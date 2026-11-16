@@ -12,6 +12,8 @@ Item {
   property var marks: []
   property string parsed: ""
   property int waveIndex: 0
+  property real pointerX: -100000
+  property real pointerY: -100000
   // 0 cone, 1 one wave, 2 both waves, then back to one wave.
   readonly property int wavePhase: waveIndex === 2 ? 2 : (waveIndex === 0 ? 0 : 1)
   property color activeInk: "#070B09"
@@ -72,6 +74,28 @@ Item {
     waveTimer.running = !!(root.marks && root.marks.length > 0)
   }
 
+  function applyCursor(raw) {
+    try {
+      var point = JSON.parse(raw || "{}")
+      if (typeof point.x !== "number" || typeof point.y !== "number")
+        return
+      root.pointerX = point.x
+      root.pointerY = point.y
+    } catch (error) {
+    }
+  }
+
+  function tipOf(mark) {
+    var parts = []
+    if (mark && mark.tipApp)
+      parts.push(mark.tipApp)
+    if (mark && mark.tipMedia)
+      parts.push(mark.tipMedia)
+    if (mark && mark.tipSink)
+      parts.push(mark.tipSink)
+    return parts.join("\n")
+  }
+
   // One phase for every pill, so two playing speakers pulse together.
   // Started from applyMarks. A binding on marks.length does not see a
   // replaced array, so the clock would never start.
@@ -92,6 +116,28 @@ Item {
         found.push(mark)
     }
     return found
+  }
+
+  // The layer mask stays empty, so this surface never takes the click.
+  // The tip follows the cursor position instead of a hover grab.
+  Process {
+    id: cursorPos
+    command: ["hyprctl", "cursorpos", "-j"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applyCursor(text)
+    }
+  }
+
+  Timer {
+    interval: 120
+    repeat: true
+    running: root.marks && root.marks.length > 0
+    triggeredOnStart: true
+    onTriggered: {
+      if (!cursorPos.running)
+        cursorPos.running = true
+    }
   }
 
   FileView {
@@ -173,10 +219,35 @@ Item {
           id: speaker
           required property var modelData
           readonly property color ink: modelData.focused ? root.activeInk : root.inactiveInk
+          readonly property string tip: root.tipOf(modelData)
+          readonly property bool hovered: {
+            var localX = root.pointerX - panel.modelData.x
+            var localY = root.pointerY - panel.modelData.y
+            return localX >= x && localX < x + width && localY >= y && localY < y + height
+          }
           width: 14
           height: 14
           x: Math.round(modelData.x + modelData.width - (modelData.iconEdge || 6) - width)
           y: Math.round(modelData.y + (modelData.height - height) / 2)
+
+          Rectangle {
+            visible: speaker.hovered && speaker.tip.length > 0
+            color: "#070B09"
+            radius: 4
+            anchors.right: parent.left
+            anchors.rightMargin: 6
+            anchors.verticalCenter: parent.verticalCenter
+            width: tipLabel.implicitWidth + 12
+            height: tipLabel.implicitHeight + 8
+
+            Text {
+              id: tipLabel
+              anchors.centerIn: parent
+              text: speaker.tip
+              color: "#FFFFFF"
+              font.pixelSize: 12
+            }
+          }
 
           // A single canvas repaint does not commit a new frame on this
           // layer. Each wave is its own item so a phase step changes opacity,

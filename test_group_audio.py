@@ -449,7 +449,23 @@ class ParseTests(unittest.TestCase):
                 },
             ]
         )
-        self.assertEqual(nodes, [{"pid": 100, "state": "running", "media_class": "Stream/Output/Audio"}])
+        self.assertEqual(
+            nodes,
+            [
+                {
+                    "pid": 100,
+                    "state": "running",
+                    "media_class": "Stream/Output/Audio",
+                    "serial": None,
+                    "name": "",
+                    "binary": "",
+                    "media_name": "Playback",
+                    "target": "",
+                    "mute": False,
+                    "corked": False,
+                }
+            ],
+        )
 
     def test_playback_nodes_carry_stream_identity(self):
         nodes = group_audio.playback_nodes(
@@ -528,6 +544,21 @@ class ParseTests(unittest.TestCase):
         clock["t"] = 0.8
         cache.has_signal(5)
         self.assertEqual(calls, [5, 5])
+
+    def test_peak_cache_keeps_a_recent_signal_through_a_quiet_probe(self):
+        answers = iter([True, False, False])
+        clock = {"t": 0.0}
+        cache = group_audio.PeakCache(
+            probe=lambda serial: next(answers),
+            now=lambda: clock["t"],
+            ttl=0.75,
+            hold=1.5,
+        )
+        self.assertTrue(cache.has_signal(5))
+        clock["t"] = 0.8
+        self.assertTrue(cache.has_signal(5))
+        clock["t"] = 2.4
+        self.assertFalse(cache.has_signal(5))
 
     def test_proc_parent_of_this_process(self):
         parent = group_audio.proc_parent(os.getpid())
