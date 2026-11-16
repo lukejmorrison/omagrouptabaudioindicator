@@ -1,4 +1,4 @@
-# Group tab speaker
+# Group Tab Audio Indicator
 
 A speaker on the Hyprland group pill of the window that is playing audio.
 
