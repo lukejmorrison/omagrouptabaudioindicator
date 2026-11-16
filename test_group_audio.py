@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Matcher and group-bar slot tests. No live desktop required."""
 
 from __future__ import annotations
 
