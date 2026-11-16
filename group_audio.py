@@ -523,7 +523,6 @@ class _Meter:
         self._thread.start()
 
     def close(self) -> None:
-        # Clear proc before kill returns so a second close cannot signal a reused pid.
         proc = self.proc
         self.proc = None
         if proc is not None and proc.poll() is None:
@@ -716,7 +715,6 @@ class PeakCache:
         heard_until = saved[1] if saved is not None else 0.0
         if fresh:
             heard_until = now + self.hold
-        # A quiet window can sit inside speech. Hold the last loud mark.
         shown = fresh or now < heard_until
         self.saved[serial] = (shown, heard_until)
         return shown
