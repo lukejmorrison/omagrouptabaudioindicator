@@ -504,6 +504,7 @@ class _Meter:
     def __init__(self, serial: int, proc: subprocess.Popen[bytes]) -> None:
         self.serial = serial
         self.proc = proc
+        self.loud_until = 0.0
         self._view: tuple[bytes | None, bool] = (None, False)
         self._ready = threading.Event()
         self._thread: threading.Thread | None = None
@@ -539,6 +540,8 @@ class _Meter:
 
     def _publish(self, pcm: bytes) -> None:
         self._view = (pcm, False)
+        if peak_has_signal(pcm):
+            self.loud_until = time.monotonic() + PEAK_HOLD_SEC
         self._ready.set()
 
     def _mark_dead(self) -> None:
@@ -713,8 +716,11 @@ class PeakCache:
         else:
             raise AssertionError(verdict)
         heard_until = saved[1] if saved is not None else 0.0
+        meter = self.meters.get(serial)
+        if meter is not None:
+            heard_until = max(heard_until, meter.loud_until)
         if fresh:
-            heard_until = now + self.hold
+            heard_until = max(heard_until, now + self.hold)
         shown = fresh or now < heard_until
         self.saved[serial] = (shown, heard_until)
         return shown

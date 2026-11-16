@@ -549,6 +549,7 @@ class ScriptMeter:
         self.pcm = pcm
         self.dead = dead
         self.closes = 0
+        self.loud_until = 0.0
 
     def view(self):
         return self.pcm, self.dead
@@ -582,6 +583,16 @@ class PeakCacheTests(unittest.TestCase):
         clock["t"] = 0.8
         self.assertTrue(cache.has_signal(5))
         clock["t"] = 2.4
+        self.assertFalse(cache.has_signal(5))
+
+    def test_meter_loud_until_bridges_quiet_between_idle_polls(self):
+        clock = {"t": 10.0}
+        script = ScriptMeter(QUIET)
+        script.loud_until = 11.4
+        cache = group_audio.PeakCache(source=lambda serial: script, now=lambda: clock["t"], hold=1.5)
+        cache.reconcile({5})
+        self.assertTrue(cache.has_signal(5))
+        clock["t"] = 11.5
         self.assertFalse(cache.has_signal(5))
 
     def test_reconcile_starts_each_serial_once(self):
