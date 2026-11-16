@@ -3,20 +3,15 @@ import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
 
-// Click-through speakers for the group pills named in group-audio.json.
-// The empty mask is the same input region the OSD uses, so the group bar
-// still receives the click.
 Item {
   id: root
 
   property var marks: []
   property string parsed: ""
   property int waveIndex: 0
-  // Global pointer from hyprctl. Empty mask means no hover grab, so the tip
-  // tracks this instead of a MouseArea.
+  // Empty mask means no hover grab, so the tip tracks hyprctl instead of a MouseArea.
   property real pointerX: -100000
   property real pointerY: -100000
-  // 0 cone, 1 one wave, 2 both waves, then back to one wave.
   readonly property int wavePhase: waveIndex === 2 ? 2 : (waveIndex === 0 ? 0 : 1)
   property color activeInk: "#070B09"
   // Qt reads an 8-digit hex as AARRGGBB. #ffffff88 is opaque yellow, not dim white.
@@ -68,7 +63,6 @@ Item {
       root.parsed = raw
       root.syncWaveTimer()
     } catch (error) {
-      // A torn read keeps the last good set. The next reload replaces it.
     }
   }
 
@@ -109,9 +103,6 @@ Item {
         && root.pointerY >= top && root.pointerY < top + mark.height
   }
 
-  // One phase for every pill, so two playing speakers pulse together.
-  // Started from applyMarks. A binding on marks.length does not see a
-  // replaced array, so the clock would never start.
   Timer {
     id: waveTimer
     interval: 180
@@ -131,8 +122,6 @@ Item {
     return found
   }
 
-  // Empty mask keeps clicks on the group bar. Poll the cursor so the tip can
-  // still open when the pointer is over a marked pill.
   Process {
     id: cursorPos
     command: ["hyprctl", "cursorpos", "-j"]
@@ -209,8 +198,7 @@ Item {
       }
       mask: Region {}
 
-      // This layer commits a buffer when a frame is scheduled. One frame per
-      // phase step is enough to show the new wave.
+      // Tip and wave opacity changes need a scheduled frame on this layer.
       FrameAnimation {
         id: present
         running: false
@@ -233,8 +221,6 @@ Item {
           required property var modelData
           readonly property color ink: modelData.focused ? root.activeInk : root.inactiveInk
           readonly property string tip: root.tipOf(modelData)
-          // Whole pill (tab + speaker). Uses mark monitor offsets, not the
-          // Quickshell screen origin — those stayed wrong across the layout.
           readonly property bool hovered: root.pillContainsPointer(modelData)
           width: 14
           height: 14
@@ -266,9 +252,7 @@ Item {
             }
           }
 
-          // A single canvas repaint does not commit a new frame on this
-          // layer. Each wave is its own item so a phase step changes opacity,
-          // which does.
+          // Separate items so a phase step changes opacity and schedules a frame.
           Canvas {
             id: body
             anchors.fill: parent

@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-"""Mark the Hyprland group pill whose window is playing audio.
-
-PipeWire says a process is audible. Hyprland says which toplevels that
-process owns. A browser with several windows is marked only when one
-title or one idle inhibitor picks a single toplevel. The painter reads
-the JSON this writes; it does not decide who is audible.
-"""
 
 from __future__ import annotations
 
@@ -160,8 +153,6 @@ def match_windows(group: list[dict], players: list[dict], parent_of) -> list[dic
         seen.add(window["address"])
         chosen.append(window)
 
-    # One MPRIS title can match several windows, and a second window can be
-    # audible without being the title MPRIS currently reports. Keep every hit.
     for player in players:
         if player.get("status") != "Playing":
             continue
@@ -343,8 +334,6 @@ def reserved_height(opts: dict) -> float:
 
 
 def pill_geometry(window: dict, index: int, count: int, opts: dict) -> tuple[float, float, float, float]:
-    # Horizontal group bar. The gradient pill is `height` tall and sits on
-    # the window. gaps_out 0 makes the reserved strip and the pill the same box.
     gaps_out = opts["gaps_out"]
     keep = 1 if opts.get("keep_upper_gap") else 0
     bar_w = (window["size"][0] - opts["gaps_in"] * (count - 1)) / count
@@ -516,7 +505,6 @@ class PeakCache:
         self.now = now or time.monotonic
         self.ttl = ttl
         self.hold = hold
-        # saved: probed_at, shown, heard_until. A 40ms speech window can sit under the floor.
         self.saved: dict[int, tuple[float, bool, float]] = {}
 
     def has_signal(self, serial: int) -> bool:
